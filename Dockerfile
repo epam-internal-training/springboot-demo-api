@@ -2,8 +2,8 @@ FROM ubuntu:20.04 as newrelic
 
 WORKDIR /tmp
 
-RUN apt-get update && \
-    apt-get install unzip  curl && \
+RUN apt-get update -y && \
+    apt-get install unzip  curl -y && \
     curl -O https://download.newrelic.com/newrelic/java-agent/newrelic-agent/current/newrelic-java.zip && \
     unzip newrelic-java.zip
 
@@ -13,7 +13,7 @@ WORKDIR /tmp
 
 COPY ./ /tmp
 
-RUN ./gradlew build
+RUN chmod +x ./gradlew && ./gradlew build
 
 FROM openjdk:20-jdk-slim as production
 
