@@ -1,0 +1,185 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+name: $(date:yy.M.d)-$(Rev:r)
+
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: Build
+  displayName: Build API
+  jobs:
+  - job: Build
+    displayName: Build API
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: "Docker login"
+      inputs:
+        azureSubscription: ${{ parameters.serviceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+            docker login epmdockerregistry.azurecr.io -u $servicePrincipalId -p $servicePrincipalKey
+    - task: Docker@2
+      displayName: "Docker build"
+      inputs:
+        command: build
+        repository: epmdockerregistry.azurecr.io/demo-api
+        dockerfile: Dockerfile
+        buildContext: '.'
+        tags: |
+          $(Build.BuildNumber)
+    - script: |
+        sudo apt install wget apt-transport-https gnupg lsb-release -y
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt update -y
+        sudo apt install trivy -y
+      displayName: "Install Trivy"
+    
+    - script: |
+        template=$(cat << 'EOF'
+        <?xml version="1.0" ?>
+        <testsuites>
+        {{- range . -}}
+        {{- $failures := len .Vulnerabilities }}
+            <testsuite tests="{{ $failures }}" failures="{{ $failures }}" name="{{  .Target }}" errors="0" skipped="0" time="">
+            {{- if not (eq .Type "") }}
+                <properties>
+                    <property name="type" value="{{ .Type }}"></property>
+                </properties>
+            {{- end -}}
+            {{ range .Vulnerabilities }}
+            <testcase classname="{{ .PkgName }}-{{ .InstalledVersion }}" name="[{{ .Vulnerability.Severity }}] {{ .VulnerabilityID }}" time="">
+                <failure message="{{ escapeXML .Title }}" type="description">{{ escapeXML .Description }}</failure>
+            </testcase>
+            {{- end }}
+            </testsuite>
+        {{- $failures := len .Misconfigurations }}
+            <testsuite tests="{{ $failures }}" failures="{{ $failures }}" name="{{  .Target }}" errors="0" skipped="0" time="">
+            {{- if not (eq .Type "") }}
+                <properties>
+                    <property name="type" value="{{ .Type }}"></property>
+                </properties>
+            {{- end -}}
+            {{ range .Misconfigurations }}
+            <testcase classname="{{ .Type }}" name="[{{ .Severity }}] {{ .ID }}" time="">
+                <failure message="{{ escapeXML .Title }}" type="description">{{ escapeXML .Description }}</failure>
+            </testcase>
+            {{- end }}
+            </testsuite>
+        {{- end }}
+        </testsuites>
+        EOF
+        )
+        mkdir junittemplate
+        echo "$template" > junittemplate/junit.tpl
+        trivyfilename=$(echo "${{ parameters.repository }}" | tr '/.' '-')
+        echo "##vso[task.setvariable variable=trivyfilename]$trivyfilename"
+        trivy image ${{ parameters.acrName }}.azurecr.io/${{ parameters.repository }}:${{ parameters.tag }} --timeout 10m
+        trivy image -f json -o results.json ${{ parameters.acrName }}.azurecr.io/${{ parameters.repository }}:${{ parameters.tag }} --timeout 10m
+        jq '[.Results[] | {Target, Class, Type, Vulnerabilities: [.Vulnerabilities[] | {VulnerabilityID, PkgName, InstalledVersion, Title, Description, Severity}]}]' results.json > $trivyfilename.json
+        trivy image \
+          --severity HIGH,MEDIUM,CRITICAL \
+          --format template \
+          --template "@junittemplate/junit.tpl" \
+          --output "test.xml" \
+          ${{ parameters.acrName }}.azurecr.io/${{ parameters.repository }}:${{ parameters.tag }} --timeout 10m
+      displayName: "Run trivy scan"
+
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/test.xml'
+        mergeTestResults: true
+        failTaskOnFailedTests: false
+        testRunTitle: 'Trivy - Vulnerabilities Summary'
+      displayName: Publish Trivy Scan Results
+
+    - task: PowerShell@2
+      displayName: Convert Trivy Json to Excel
+      inputs:
+        targetType: 'inline'
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $Modules = @("ImportExcel") 
+
+          foreach ($Module in $Modules) {
+              if (Get-Module -ListAvailable -Name $Module) {
+                  Write-Host "Module is already installed:  $Module"        
+              }
+              else {
+                  try {
+                      Install-Module $Module -Force -Confirm:$false -Scope CurrentUser
+                      # "Module was installed the simple way:  $Module"
+                  }
+                  catch {
+                      try {
+                          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                          Install-PackageProvider -Name NuGet  -MinimumVersion 2.8.5.201 -Force
+                          Install-Module $Module -Force -Confirm:$false -Scope CurrentUser
+                          # "Module was installed the advanced way:  $Module"
+                      }
+                      catch {
+                          Write-Host "##[error]Exception occured. $($_.Exception.Message)`nStack Trace:`n$($_.ScriptStackTrace)"
+                          Write-Error "Could not install module: $Module"
+                      }
+                  }
+              }
+
+              # "Import Module:  $Module"
+              Import-module $Module
+          }
+          $jsonData = Get-Content -Raw -Path "$(trivyfilename).json" | ConvertFrom-Json
+          
+          $customObjects = $jsonData | ForEach-Object {
+              $target = $_.Target
+              $class = $_.Class
+              $type = $_.Type
+              foreach ($vulnerability in $_.Vulnerabilities) {
+                  [PsCustomObject]@{
+                      Target = $target
+                      Class = $class
+                      Type = $type
+                      VulnerabilityID = $vulnerability.VulnerabilityID
+                      Severity = $vulnerability.Severity
+                      PkgName = $vulnerability.PkgName
+                      InstalledVersion = $vulnerability.InstalledVersion
+                      Title = $vulnerability.Title
+                      Description = $vulnerability.Description
+                  }
+              }
+          }
+          
+          $customObjects | Export-Excel -Path "$(trivyfilename).xlsx" -WorksheetName "Results" -AutoSize -FreezeTopRow -BoldTopRow
+        failOnStderr: true
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)/$(trivyfilename).xlsx' 
+        ArtifactName: 'trivy' 
+        publishLocation: 'Container'
+      displayName: Upload Trivy Scan Results File
+
+    - script: |
+        docker push epmdockerregistry.azurecr.io/demo-api:$(Build.BuildNumber)
+      displayName: "Docker push"
+
+- stage: Deploy
+  displayName: Deploy API
+  jobs:
+  - job: Deploy
+    displayName: Deploy API
+    steps:
+    - checkout: self
+    - script: |
+       echo "Add your deployment tasks here"
