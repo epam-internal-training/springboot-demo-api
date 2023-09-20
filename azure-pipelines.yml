@@ -22,7 +22,7 @@ stages:
     - task: AzureCLI@2
       displayName: "Docker login"
       inputs:
-        azureSubscription: ${{ parameters.serviceConnection }}
+        azureSubscription: azureServiceConnection
         scriptType: bash
         scriptLocation: inlineScript
         addSpnToEnvironment: true
@@ -82,17 +82,17 @@ stages:
         )
         mkdir junittemplate
         echo "$template" > junittemplate/junit.tpl
-        trivyfilename=$(echo "${{ parameters.repository }}" | tr '/.' '-')
+        trivyfilename=$(echo "demo-api" | tr '/.' '-')
         echo "##vso[task.setvariable variable=trivyfilename]$trivyfilename"
-        trivy image ${{ parameters.acrName }}.azurecr.io/${{ parameters.repository }}:${{ parameters.tag }} --timeout 10m
-        trivy image -f json -o results.json ${{ parameters.acrName }}.azurecr.io/${{ parameters.repository }}:${{ parameters.tag }} --timeout 10m
+        trivy image epmdockerregistry.azurecr.io/demo-api:$(Build.BuildNumber) --timeout 10m
+        trivy image -f json -o results.json epmdockerregistry.azurecr.io/demo-api:$(Build.BuildNumber) --timeout 10m
         jq '[.Results[] | {Target, Class, Type, Vulnerabilities: [.Vulnerabilities[] | {VulnerabilityID, PkgName, InstalledVersion, Title, Description, Severity}]}]' results.json > $trivyfilename.json
         trivy image \
           --severity HIGH,MEDIUM,CRITICAL \
           --format template \
           --template "@junittemplate/junit.tpl" \
           --output "test.xml" \
-          ${{ parameters.acrName }}.azurecr.io/${{ parameters.repository }}:${{ parameters.tag }} --timeout 10m
+          epmdockerregistry.azurecr.io/demo-api:$(Build.BuildNumber) --timeout 10m
       displayName: "Run trivy scan"
 
 
